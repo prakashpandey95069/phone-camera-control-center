@@ -297,6 +297,7 @@ function PhonePage() {
   };
 
 
+
 const switchCamera = async () => {
   const oldStream = streamRef.current;
   const pc = pcRef.current;
@@ -304,60 +305,121 @@ const switchCamera = async () => {
     item => item.track?.kind === "video"
   );
 
+  const oldTrack = oldStream?.getVideoTracks()[0];
+  const oldSettings = oldTrack?.getSettings() || {};
+  const oldFacing =
+    oldSettings.facingMode || facingRef.current || "environment";
+
+  let targetFacing =
+    oldFacing === "environment" ? "user" : "environment";
+
+  let nextStream = null;
+
   try {
+    // Find the other camera using facingMode where possible.
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cameras = devices.filter(
       device => device.kind === "videoinput"
     );
 
     if (cameras.length < 2) {
-      throw new Error("Second camera not found on this device.");
+      throw new Error("Only one camera is available to the browser.");
     }
 
-    const currentTrack = oldStream?.getVideoTracks()[0];
-    const currentId = currentTrack?.getSettings().deviceId;
-    const currentIndex = cameras.findIndex(
-      camera => camera.deviceId === currentId
+    const currentId = oldSettings.deviceId;
+    let targetCamera = cameras.find(
+      camera => camera.deviceId !== currentId
     );
 
-    const nextCamera =
-      cameras[(currentIndex + 1 + cameras.length) % cameras.length];
+    // Release the old camera before opening the next one.
+    oldStream?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
 
-    const nextStream =
-      await navigator.mediaDevices.getUserMedia({
+    try {
+      nextStream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
-          deviceId: { exact: nextCamera.deviceId },
+          facingMode: { ideal: targetFacing },
           width: { ideal: 1280 },
           height: { ideal: 720 }
         }
       });
+    } catch {
+      // Fallback to the other enumerated camera.
+      if (!targetCamera) throw new Error("Could not find another camera.");
+
+      nextStream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          deviceId: { exact: targetCamera.deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      });
+    }
 
     const nextTrack = nextStream.getVideoTracks()[0];
+    if (!nextTrack) throw new Error("No video track returned.");
 
     if (sender) {
       await sender.replaceTrack(nextTrack);
     }
 
     streamRef.current = nextStream;
+    facingRef.current =
+      nextTrack.getSettings().facingMode || targetFacing;
 
     if (videoRef.current) {
       videoRef.current.srcObject = nextStream;
       await videoRef.current.play();
     }
 
-    oldStream?.getTracks().forEach(track => track.stop());
-
-    facingRef.current =
-      nextTrack.getSettings().facingMode || "environment";
-
-    setError("");
     setCameraReady(true);
+    setError("");
     setStatus("Camera switched successfully.");
   } catch (error) {
-    setError(`Could not switch camera: ${error.message}`);
+    nextStream?.getTracks().forEach(track => track.stop());
+
+    // Try to restore the original camera if switching failed.
+    try {
+      const restoredStream =
+        await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: oldFacing },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
+
+      const restoredTrack = restoredStream.getVideoTracks()[0];
+
+      if (sender && restoredTrack) {
+        await sender.replaceTrack(restoredTrack);
+      }
+
+      streamRef.current = restoredStream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = restoredStream;
+        await videoRef.current.play();
+      }
+
+      setCameraReady(true);
+    } catch (restoreError) {
+      streamRef.current = null;
+      setCameraReady(false);
+      setError(
+        `Camera switch failed: ${error.message}. ` +
+        `Camera restore failed: ${restoreError.message}.`
+      );
+      return;
+    }
+
+    setError(`Camera switch failed: ${error.message}. Previous camera restored.`);
   }
 };
+
 
   const startRecording = () => {
     const stream = streamRef.current;
