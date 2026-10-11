@@ -1,29 +1,48 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import {
-  Camera, CameraOff, CircleStop, Clipboard, Download, FlipHorizontal, Link2,
-  Monitor, Power, Radio, RefreshCw, ShieldCheck, Smartphone, Video, Wifi, X
+  Camera, CameraOff, CircleStop, Clipboard, FlipHorizontal, Link2,
+  Power, Radio, RefreshCw, ShieldCheck, Smartphone, Video, Wifi, X
 } from "lucide-react";
 
 const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || window.location.origin;
-const TURN_URL = import.meta.env.VITE_TURN_URL;
+
+const TURN_USER = import.meta.env.VITE_TURN_USERNAME;
+const TURN_CRED = import.meta.env.VITE_TURN_CREDENTIAL;
+
+if (!TURN_USER || !TURN_CRED) {
+  console.error("TURN credentials missing! Vercel env vars check karo aur redeploy karo.");
+}
+
 const ICE_SERVERS = [
-  {
-    urls: "stun:stun.relay.metered.ca:80",
-  },
-  {
-    urls: [
-      "turn:global.relay.metered.ca:80",
-      "turn:global.relay.metered.ca:80?transport=tcp",
-    ],
-    username: import.meta.env.VITE_TURN_USERNAME,
-    credential: import.meta.env.VITE_TURN_CREDENTIAL,
-  },
+  { urls: "stun:stun.relay.metered.ca:80" },
+  { urls: "turn:global.relay.metered.ca:80", username: TURN_USER, credential: TURN_CRED },
+  { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: TURN_USER, credential: TURN_CRED },
+  { urls: "turn:global.relay.metered.ca:443", username: TURN_USER, credential: TURN_CRED },
+  { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: TURN_USER, credential: TURN_CRED },
 ];
 
 function makeSocket() {
   return io(SIGNALING_URL, { transports: ["websocket", "polling"], reconnection: true });
 }
+
+// Remote ICE candidate ko tabhi add karo jab remoteDescription set ho, warna queue me rakho
+async function addOrQueueIce(pc, queueRef, candidate) {
+  if (!candidate) return;
+  if (pc && pc.remoteDescription) {
+    try { await pc.addIceCandidate(candidate); } catch (e) { console.warn("addIceCandidate failed", e); }
+  } else {
+    queueRef.current.push(candidate);
+  }
+}
+async function flushIce(pc, queueRef) {
+  const list = queueRef.current;
+  queueRef.current = [];
+  for (const c of list) {
+    try { await pc.addIceCandidate(c); } catch (e) { console.warn("queued addIceCandidate failed", e); }
+  }
+}
+
 function StatusPill({ children, good = false }) {
   return <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs ${good ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-slate-700 bg-slate-800/70 text-slate-300"}`}><span className={`h-1.5 w-1.5 rounded-full ${good ? "bg-emerald-400" : "bg-slate-500"}`} />{children}</span>;
 }
@@ -37,10 +56,13 @@ export default function App() {
   return isPhoneRoute ? <PhonePage /> : <Dashboard />;
 }
 
+/* ----------------------------- DASHBOARD ----------------------------- */
+
 function Dashboard() {
   const socketRef = useRef(null);
   const pcRef = useRef(null);
   const videoRef = useRef(null);
+  const pendingIceRef = useRef([]);
   const [code, setCode] = useState("");
   const [status, setStatus] = useState("Connecting to signaling server…");
   const [connected, setConnected] = useState(false);
@@ -54,6 +76,7 @@ function Dashboard() {
   const teardownPeer = useCallback(() => {
     if (pcRef.current) { pcRef.current.ontrack = null; pcRef.current.close(); pcRef.current = null; }
     if (videoRef.current) videoRef.current.srcObject = null;
+    pendingIceRef.current = [];
     setConnected(false); setRecording(false); setStats("WebRTC not connected");
   }, []);
 
@@ -62,12 +85,16 @@ function Dashboard() {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     pcRef.current = pc;
     pc.ontrack = event => {
-      if (videoRef.current) videoRef.current.srcObject = event.streams[0];
+      if (videoRef.current) {
+        videoRef.current.srcObject = event.streams[0];
+        videoRef.current.play?.().catch(() => {});
+      }
       setCameraStatus("Live camera feed");
     };
     pc.onicecandidate = event => {
       if (event.candidate) socketRef.current?.emit("webrtc:ice", { candidate: event.candidate });
     };
+    pc.onicecandidateerror = e => console.warn("ICE candidate error", e.errorCode, e.errorText, e.url);
     pc.onconnectionstatechange = () => {
       setStats(`WebRTC: ${pc.connectionState}`);
       if (pc.connectionState === "connected") setConnected(true);
@@ -93,12 +120,15 @@ function Dashboard() {
       } catch (e) { setError(`Could not start video connection: ${e.message}`); }
     });
     socket.on("webrtc:answer", async ({ description }) => {
-      try { if (pcRef.current && description) await pcRef.current.setRemoteDescription(description); }
-      catch (e) { setError(`WebRTC answer error: ${e.message}`); }
+      try {
+        const pc = pcRef.current;
+        if (pc && description) {
+          await pc.setRemoteDescription(description);
+          await flushIce(pc, pendingIceRef);
+        }
+      } catch (e) { setError(`WebRTC answer error: ${e.message}`); }
     });
-    socket.on("webrtc:ice", async ({ candidate }) => {
-      try { if (pcRef.current && candidate) await pcRef.current.addIceCandidate(candidate); } catch {}
-    });
+    socket.on("webrtc:ice", ({ candidate }) => addOrQueueIce(pcRef.current, pendingIceRef, candidate));
     socket.on("camera:status", ({ message }) => setCameraStatus(message || "Phone camera status updated"));
     socket.on("recording:status", ({ recording: active, message }) => { setRecording(Boolean(active)); if (message) setCameraStatus(message); });
     socket.on("camera:photo", ({ dataUrl }) => {
@@ -183,6 +213,8 @@ function Dashboard() {
   </div>;
 }
 
+/* ------------------------------- PHONE -------------------------------- */
+
 function PhonePage() {
   const socketRef = useRef(null);
   const pcRef = useRef(null);
@@ -192,6 +224,8 @@ function PhonePage() {
   const chunksRef = useRef([]);
   const facingRef = useRef("environment");
   const torchRef = useRef(false);
+  const pendingIceRef = useRef([]);
+  const camPromiseRef = useRef(null);
   const [code, setCode] = useState("");
   const [status, setStatus] = useState("Enter the pairing code shown on your dashboard.");
   const [joined, setJoined] = useState(false);
@@ -208,6 +242,8 @@ function PhonePage() {
     setCameraReady(false);
   }, []);
 
+  // NOTE: pendingIceRef yahan clear nahi hota, kyunki makePeer isse call karta hai
+  // aur offer se pehle aaye hue ICE candidates mit jayenge.
   const stopPeer = useCallback(() => {
     pcRef.current?.close(); pcRef.current = null;
   }, []);
@@ -231,17 +267,26 @@ function PhonePage() {
     }
   }, []);
 
+  // Camera ek hi baar start ho (approve aur offer dono ek saath camera maangte hain)
+  const ensureCamera = useCallback(() => {
+    if (streamRef.current) return Promise.resolve(streamRef.current);
+    if (!camPromiseRef.current) {
+      camPromiseRef.current = startCamera().finally(() => { camPromiseRef.current = null; });
+    }
+    return camPromiseRef.current;
+  }, [startCamera]);
+
   const makePeer = useCallback(async () => {
     stopPeer();
-    const stream = streamRef.current || await startCamera();
+    const stream = await ensureCamera();
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     pcRef.current = pc;
     stream.getTracks().forEach(track => pc.addTrack(track, stream));
     pc.onicecandidate = event => { if (event.candidate) socketRef.current?.emit("webrtc:ice", { candidate: event.candidate }); };
+    pc.onicecandidateerror = e => console.warn("ICE candidate error", e.errorCode, e.errorText, e.url);
     pc.onconnectionstatechange = () => setStatus(`Video connection: ${pc.connectionState}`);
-    pc.onnegotiationneeded = () => {};
     return pc;
-  }, [startCamera, stopPeer]);
+  }, [ensureCamera, stopPeer]);
 
   useEffect(() => {
     const socket = makeSocket(); socketRef.current = socket;
@@ -249,7 +294,7 @@ function PhonePage() {
     socket.on("disconnect", () => setStatus("Signaling server disconnected."));
     socket.on("pair:approved", async () => {
       setApproved(true); setError(""); setStatus("Approved. Starting camera…");
-      try { await startCamera(); setStatus("Camera ready. Connecting video…"); }
+      try { await ensureCamera(); setStatus("Camera ready. Connecting video…"); }
       catch { setApproved(false); }
     });
     socket.on("pair:rejected", () => { setApproved(false); setJoined(false); setStatus("Pairing request rejected."); });
@@ -257,15 +302,14 @@ function PhonePage() {
       try {
         const pc = await makePeer();
         await pc.setRemoteDescription(description);
+        await flushIce(pc, pendingIceRef);
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit("webrtc:answer", { description: pc.localDescription });
         setStatus("Sending live video to dashboard.");
       } catch (e) { setError(`Could not establish video: ${e.message}`); }
     });
-    socket.on("webrtc:ice", async ({ candidate }) => {
-      try { if (pcRef.current && candidate) await pcRef.current.addIceCandidate(candidate); } catch {}
-    });
+    socket.on("webrtc:ice", ({ candidate }) => addOrQueueIce(pcRef.current, pendingIceRef, candidate));
     socket.on("camera:command", async command => {
       try {
         if (command.type === "capture") capturePhoto();
@@ -276,10 +320,12 @@ function PhonePage() {
       } catch (e) { setError(e.message || "Camera command failed."); }
     });
     socket.on("session:ended", ({ reason }) => {
+      pendingIceRef.current = [];
       stopPeer(); stopCamera(); setApproved(false); setJoined(false); setStatus(reason || "Session ended.");
     });
     return () => { socket.emit("room:leave"); socket.disconnect(); stopPeer(); stopCamera(); };
-  }, [makePeer, startCamera, stopCamera, stopPeer]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [makePeer, ensureCamera, stopCamera, stopPeer]);
 
   const joinRoom = () => {
     setError("");
@@ -290,6 +336,7 @@ function PhonePage() {
       setJoined(true); setStatus("Request sent. Approve the phone on your dashboard.");
     });
   };
+
   const capturePhoto = () => {
     const video = videoRef.current;
     if (!video || video.videoWidth === 0) return setError("Camera is not ready yet.");
@@ -301,108 +348,99 @@ function PhonePage() {
     setStatus("Photo captured and sent to dashboard.");
   };
 
+  const switchCamera = async () => {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-
-const switchCamera = async () => {
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-  const openCamera = async (video, retries = 3) => {
-    let lastErr;
-    for (let i = 0; i < retries; i++) {
-      try {
-        return await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video,
-        });
-      } catch (e) {
-        lastErr = e;
-        if (e.name !== "NotReadableError" && e.name !== "AbortError") throw e;
-        await sleep(400 * (i + 1));
+    const openCamera = async (video, retries = 3) => {
+      let lastErr;
+      for (let i = 0; i < retries; i++) {
+        try {
+          return await navigator.mediaDevices.getUserMedia({ audio: false, video });
+        } catch (e) {
+          lastErr = e;
+          if (e.name !== "NotReadableError" && e.name !== "AbortError") throw e;
+          await sleep(400 * (i + 1));
+        }
       }
-    }
-    throw lastErr;
-  };
+      throw lastErr;
+    };
 
-  const applyStream = async (stream) => {
-    const track = stream.getVideoTracks()[0];
-    if (!track) throw new Error("No video track returned.");
+    const applyStream = async (stream) => {
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new Error("No video track returned.");
 
-    const sender = pcRef.current
-      ?.getSenders()
-      .find((s) => s.track?.kind === "video" || s.track === null);
-    if (sender) await sender.replaceTrack(track);
+      const sender = pcRef.current
+        ?.getSenders()
+        .find((s) => s.track?.kind === "video" || s.track === null);
+      if (sender) await sender.replaceTrack(track);
 
-    streamRef.current = stream;
+      streamRef.current = stream;
 
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play().catch(() => {});
-    }
-    return track;
-  };
-
-  const oldTrack = streamRef.current?.getVideoTracks()[0];
-  const oldSettings = oldTrack?.getSettings() || {};
-  const oldFacing =
-    oldSettings.facingMode || facingRef.current || "environment";
-  const oldId = oldSettings.deviceId;
-  const targetFacing = oldFacing === "environment" ? "user" : "environment";
-
-  // Stop karne se pehle camera list lo
-  let cameras = [];
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    cameras = devices.filter((d) => d.kind === "videoinput");
-  } catch {}
-
-  // Purana camera poori tarah release karo
-  streamRef.current?.getTracks().forEach((t) => t.stop());
-  streamRef.current = null;
-  pcRef.current?.getSenders().forEach((s) => {
-    if (s.track?.kind === "video") s.track.stop();
-  });
-  if (videoRef.current) videoRef.current.srcObject = null;
-
-  await sleep(500); // hardware release hone do
-
-  try {
-    let stream = await openCamera({ facingMode: { ideal: targetFacing } });
-    let track = stream.getVideoTracks()[0];
-
-    // Agar wahi purana camera khul gaya, toh deviceId se doosra kholo
-    if (oldId && track.getSettings().deviceId === oldId) {
-      const other = cameras.find((c) => c.deviceId && c.deviceId !== oldId);
-      if (other) {
-        stream.getTracks().forEach((t) => t.stop());
-        await sleep(400);
-        stream = await openCamera({ deviceId: { exact: other.deviceId } });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play().catch(() => {});
       }
-    }
+      return track;
+    };
 
-    track = await applyStream(stream);
-    facingRef.current = track.getSettings().facingMode || targetFacing;
+    const oldTrack = streamRef.current?.getVideoTracks()[0];
+    const oldSettings = oldTrack?.getSettings() || {};
+    const oldFacing = oldSettings.facingMode || facingRef.current || "environment";
+    const oldId = oldSettings.deviceId;
+    const targetFacing = oldFacing === "environment" ? "user" : "environment";
 
-    setCameraReady(true);
-    setError("");
-    setStatus("Camera switched successfully.");
-  } catch (err) {
-    // Switch fail hua, purana camera wapas lao
+    // Stop karne se pehle camera list lo
+    let cameras = [];
     try {
-      await sleep(500);
-      const stream = await openCamera({ facingMode: { ideal: oldFacing } });
-      await applyStream(stream);
-      setCameraReady(true);
-      setError(`Switch failed (${err.name}). Previous camera restored.`);
-    } catch (restoreErr) {
-      streamRef.current = null;
-      setCameraReady(false);
-      setError(
-        `Switch failed: ${err.name}. Restore failed: ${restoreErr.name}.`
-      );
-    }
-  }
-};
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      cameras = devices.filter((d) => d.kind === "videoinput");
+    } catch {}
 
+    // Purana camera poori tarah release karo
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    pcRef.current?.getSenders().forEach((s) => {
+      if (s.track?.kind === "video") s.track.stop();
+    });
+    if (videoRef.current) videoRef.current.srcObject = null;
+
+    await sleep(500); // hardware release hone do
+
+    try {
+      let stream = await openCamera({ facingMode: { ideal: targetFacing } });
+      let track = stream.getVideoTracks()[0];
+
+      // Agar wahi purana camera khul gaya, toh deviceId se doosra kholo
+      if (oldId && track.getSettings().deviceId === oldId) {
+        const other = cameras.find((c) => c.deviceId && c.deviceId !== oldId);
+        if (other) {
+          stream.getTracks().forEach((t) => t.stop());
+          await sleep(400);
+          stream = await openCamera({ deviceId: { exact: other.deviceId } });
+        }
+      }
+
+      track = await applyStream(stream);
+      facingRef.current = track.getSettings().facingMode || targetFacing;
+
+      setCameraReady(true);
+      setError("");
+      setStatus("Camera switched successfully.");
+    } catch (err) {
+      // Switch fail hua, purana camera wapas lao
+      try {
+        await sleep(500);
+        const stream = await openCamera({ facingMode: { ideal: oldFacing } });
+        await applyStream(stream);
+        setCameraReady(true);
+        setError(`Switch failed (${err.name}). Previous camera restored.`);
+      } catch (restoreErr) {
+        streamRef.current = null;
+        setCameraReady(false);
+        setError(`Switch failed: ${err.name}. Restore failed: ${restoreErr.name}.`);
+      }
+    }
+  };
 
   const startRecording = () => {
     const stream = streamRef.current;
@@ -440,6 +478,7 @@ const switchCamera = async () => {
   };
   const disconnect = () => {
     socketRef.current?.emit("room:leave");
+    pendingIceRef.current = [];
     stopPeer(); stopCamera(); setJoined(false); setApproved(false); setStatus("Disconnected.");
   };
 
