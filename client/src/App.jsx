@@ -295,32 +295,53 @@ function PhonePage() {
     socketRef.current?.emit("camera:photo", { dataUrl });
     setStatus("Photo captured and sent to dashboard.");
   };
-  const switchCamera = async () => {
-    const pc = pcRef.current;
-    const oldStream = streamRef.current;
-    facingRef.current = facingRef.current === "environment" ? "user" : "environment";
-    try {
-      if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera API unavailable. Open this page over HTTPS in Chrome.");
-      const nextStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: { facingMode: { ideal: facingRef.current }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 24, max: 30 } }
-      });
-      const nextTrack = nextStream.getVideoTracks()[0];
-      const sender = pc?.getSenders().find(s => s.track?.kind === "video");
-      if (sender && nextTrack) await sender.replaceTrack(nextTrack);
-      oldStream?.getTracks().forEach(track => track.stop());
-      streamRef.current = nextStream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = nextStream;
-        await videoRef.current.play().catch(() => {});
+const switchCamera = async () => {
+  const pc = pcRef.current;
+  const oldStream = streamRef.current;
+  const oldTrack = oldStream?.getVideoTracks()[0];
+
+  facingRef.current =
+    facingRef.current === "environment" ? "user" : "environment";
+
+  try {
+    // Release the current camera before opening the other one.
+    oldTrack?.stop();
+
+    const nextStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: {
+        facingMode: { exact: facingRef.current },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
       }
-      setCameraReady(true);
-      setStatus("Camera switched.");
-    } catch (e) {
-      facingRef.current = facingRef.current === "environment" ? "user" : "environment";
-      setError(`Could not switch camera: ${e.message}`);
+    });
+
+    const nextTrack = nextStream.getVideoTracks()[0];
+    const sender = pc?.getSenders().find(
+      s => s.track?.kind === "video"
+    );
+
+    if (sender && nextTrack) {
+      await sender.replaceTrack(nextTrack);
     }
-  };
+
+    // Release any remaining tracks from the old stream.
+    oldStream?.getTracks().forEach(track => track.stop());
+
+    streamRef.current = nextStream;
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = nextStream;
+      await videoRef.current.play();
+    }
+
+    setCameraReady(true);
+    setError("");
+    setStatus("Camera switched successfully.");
+  } catch (e) {
+    setError(`Could not switch camera: ${e.message}`);
+  }
+};
   const startRecording = () => {
     const stream = streamRef.current;
     if (!stream) return setError("Camera is not ready.");
