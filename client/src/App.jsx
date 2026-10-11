@@ -8,12 +8,17 @@ import {
 const SIGNALING_URL = import.meta.env.VITE_SIGNALING_URL || window.location.origin;
 const TURN_URL = import.meta.env.VITE_TURN_URL;
 const ICE_SERVERS = [
-  { urls: "stun:stun.l.google.com:19302" },
-  ...(TURN_URL ? [{
-    urls: TURN_URL,
+  {
+    urls: "stun:stun.relay.metered.ca:80",
+  },
+  {
+    urls: [
+      "turn:global.relay.metered.ca:80",
+      "turn:global.relay.metered.ca:80?transport=tcp",
+    ],
     username: import.meta.env.VITE_TURN_USERNAME,
-    credential: import.meta.env.VITE_TURN_CREDENTIAL
-  }] : [])
+    credential: import.meta.env.VITE_TURN_CREDENTIAL,
+  },
 ];
 
 function makeSocket() {
