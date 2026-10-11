@@ -296,43 +296,50 @@ function PhonePage() {
     setStatus("Photo captured and sent to dashboard.");
   };
 
+
 const switchCamera = async () => {
   const oldStream = streamRef.current;
   const pc = pcRef.current;
-
   const sender = pc?.getSenders().find(
     item => item.track?.kind === "video"
   );
 
-  const nextFacing =
-    facingRef.current === "environment" ? "user" : "environment";
-
-  let nextStream;
-
   try {
-    // Request the other camera while retaining the old track.
-    nextStream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        facingMode: { ideal: nextFacing },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      }
-    });
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter(
+      device => device.kind === "videoinput"
+    );
+
+    if (cameras.length < 2) {
+      throw new Error("Second camera not found on this device.");
+    }
+
+    const currentTrack = oldStream?.getVideoTracks()[0];
+    const currentId = currentTrack?.getSettings().deviceId;
+    const currentIndex = cameras.findIndex(
+      camera => camera.deviceId === currentId
+    );
+
+    const nextCamera =
+      cameras[(currentIndex + 1 + cameras.length) % cameras.length];
+
+    const nextStream =
+      await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          deviceId: { exact: nextCamera.deviceId },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      });
 
     const nextTrack = nextStream.getVideoTracks()[0];
 
-    if (!nextTrack) {
-      throw new Error("No video track found.");
-    }
-
-    // Replace the WebRTC sender's track before stopping the old one.
     if (sender) {
       await sender.replaceTrack(nextTrack);
     }
 
     streamRef.current = nextStream;
-    facingRef.current = nextFacing;
 
     if (videoRef.current) {
       videoRef.current.srcObject = nextStream;
@@ -341,11 +348,13 @@ const switchCamera = async () => {
 
     oldStream?.getTracks().forEach(track => track.stop());
 
-    setCameraReady(true);
+    facingRef.current =
+      nextTrack.getSettings().facingMode || "environment";
+
     setError("");
+    setCameraReady(true);
     setStatus("Camera switched successfully.");
   } catch (error) {
-    nextStream?.getTracks().forEach(track => track.stop());
     setError(`Could not switch camera: ${error.message}`);
   }
 };
