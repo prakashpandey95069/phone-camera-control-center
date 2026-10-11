@@ -295,53 +295,61 @@ function PhonePage() {
     socketRef.current?.emit("camera:photo", { dataUrl });
     setStatus("Photo captured and sent to dashboard.");
   };
-const switchCamera = async () => {
-  const pc = pcRef.current;
-  const oldStream = streamRef.current;
-  const oldTrack = oldStream?.getVideoTracks()[0];
 
-  facingRef.current =
+const switchCamera = async () => {
+  const oldStream = streamRef.current;
+  const pc = pcRef.current;
+
+  const sender = pc?.getSenders().find(
+    item => item.track?.kind === "video"
+  );
+
+  const nextFacing =
     facingRef.current === "environment" ? "user" : "environment";
 
-  try {
-    // Release the current camera before opening the other one.
-    oldTrack?.stop();
+  let nextStream;
 
-    const nextStream = await navigator.mediaDevices.getUserMedia({
+  try {
+    // Request the other camera while retaining the old track.
+    nextStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: {
-        facingMode: { exact: facingRef.current },
+        facingMode: { ideal: nextFacing },
         width: { ideal: 1280 },
         height: { ideal: 720 }
       }
     });
 
     const nextTrack = nextStream.getVideoTracks()[0];
-    const sender = pc?.getSenders().find(
-      s => s.track?.kind === "video"
-    );
 
-    if (sender && nextTrack) {
+    if (!nextTrack) {
+      throw new Error("No video track found.");
+    }
+
+    // Replace the WebRTC sender's track before stopping the old one.
+    if (sender) {
       await sender.replaceTrack(nextTrack);
     }
 
-    // Release any remaining tracks from the old stream.
-    oldStream?.getTracks().forEach(track => track.stop());
-
     streamRef.current = nextStream;
+    facingRef.current = nextFacing;
 
     if (videoRef.current) {
       videoRef.current.srcObject = nextStream;
       await videoRef.current.play();
     }
 
+    oldStream?.getTracks().forEach(track => track.stop());
+
     setCameraReady(true);
     setError("");
     setStatus("Camera switched successfully.");
-  } catch (e) {
-    setError(`Could not switch camera: ${e.message}`);
+  } catch (error) {
+    nextStream?.getTracks().forEach(track => track.stop());
+    setError(`Could not switch camera: ${error.message}`);
   }
 };
+
   const startRecording = () => {
     const stream = streamRef.current;
     if (!stream) return setError("Camera is not ready.");
