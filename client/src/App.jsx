@@ -299,124 +299,102 @@ function PhonePage() {
 
 
 const switchCamera = async () => {
-  const oldStream = streamRef.current;
-  const pc = pcRef.current;
-  const sender = pc?.getSenders().find(
-    item => item.track?.kind === "video"
-  );
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  const oldTrack = oldStream?.getVideoTracks()[0];
+  const openCamera = async (video, retries = 3) => {
+    let lastErr;
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video,
+        });
+      } catch (e) {
+        lastErr = e;
+        if (e.name !== "NotReadableError" && e.name !== "AbortError") throw e;
+        await sleep(400 * (i + 1));
+      }
+    }
+    throw lastErr;
+  };
+
+  const applyStream = async (stream) => {
+    const track = stream.getVideoTracks()[0];
+    if (!track) throw new Error("No video track returned.");
+
+    const sender = pcRef.current
+      ?.getSenders()
+      .find((s) => s.track?.kind === "video" || s.track === null);
+    if (sender) await sender.replaceTrack(track);
+
+    streamRef.current = stream;
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      await videoRef.current.play().catch(() => {});
+    }
+    return track;
+  };
+
+  const oldTrack = streamRef.current?.getVideoTracks()[0];
   const oldSettings = oldTrack?.getSettings() || {};
   const oldFacing =
     oldSettings.facingMode || facingRef.current || "environment";
+  const oldId = oldSettings.deviceId;
+  const targetFacing = oldFacing === "environment" ? "user" : "environment";
 
-  let targetFacing =
-    oldFacing === "environment" ? "user" : "environment";
+  // Stop karne se pehle camera list lo
+  let cameras = [];
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    cameras = devices.filter((d) => d.kind === "videoinput");
+  } catch {}
 
-  let nextStream = null;
+  // Purana camera poori tarah release karo
+  streamRef.current?.getTracks().forEach((t) => t.stop());
+  streamRef.current = null;
+  pcRef.current?.getSenders().forEach((s) => {
+    if (s.track?.kind === "video") s.track.stop();
+  });
+  if (videoRef.current) videoRef.current.srcObject = null;
+
+  await sleep(500); // hardware release hone do
 
   try {
-    // Find the other camera using facingMode where possible.
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const cameras = devices.filter(
-      device => device.kind === "videoinput"
-    );
+    let stream = await openCamera({ facingMode: { ideal: targetFacing } });
+    let track = stream.getVideoTracks()[0];
 
-    if (cameras.length < 2) {
-      throw new Error("Only one camera is available to the browser.");
+    // Agar wahi purana camera khul gaya, toh deviceId se doosra kholo
+    if (oldId && track.getSettings().deviceId === oldId) {
+      const other = cameras.find((c) => c.deviceId && c.deviceId !== oldId);
+      if (other) {
+        stream.getTracks().forEach((t) => t.stop());
+        await sleep(400);
+        stream = await openCamera({ deviceId: { exact: other.deviceId } });
+      }
     }
 
-    const currentId = oldSettings.deviceId;
-    let targetCamera = cameras.find(
-      camera => camera.deviceId !== currentId
-    );
-
-    // Release the old camera before opening the next one.
-    oldStream?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
-
-    try {
-      nextStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: targetFacing },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        }
-      });
-    } catch {
-      // Fallback to the other enumerated camera.
-      if (!targetCamera) throw new Error("Could not find another camera.");
-
-      nextStream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          deviceId: { exact: targetCamera.deviceId },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        }
-      });
-    }
-
-    const nextTrack = nextStream.getVideoTracks()[0];
-    if (!nextTrack) throw new Error("No video track returned.");
-
-    if (sender) {
-      await sender.replaceTrack(nextTrack);
-    }
-
-    streamRef.current = nextStream;
-    facingRef.current =
-      nextTrack.getSettings().facingMode || targetFacing;
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = nextStream;
-      await videoRef.current.play();
-    }
+    track = await applyStream(stream);
+    facingRef.current = track.getSettings().facingMode || targetFacing;
 
     setCameraReady(true);
     setError("");
     setStatus("Camera switched successfully.");
-  } catch (error) {
-    nextStream?.getTracks().forEach(track => track.stop());
-
-    // Try to restore the original camera if switching failed.
+  } catch (err) {
+    // Switch fail hua, purana camera wapas lao
     try {
-      const restoredStream =
-        await navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: {
-            facingMode: { ideal: oldFacing },
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
-          }
-        });
-
-      const restoredTrack = restoredStream.getVideoTracks()[0];
-
-      if (sender && restoredTrack) {
-        await sender.replaceTrack(restoredTrack);
-      }
-
-      streamRef.current = restoredStream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = restoredStream;
-        await videoRef.current.play();
-      }
-
+      await sleep(500);
+      const stream = await openCamera({ facingMode: { ideal: oldFacing } });
+      await applyStream(stream);
       setCameraReady(true);
-    } catch (restoreError) {
+      setError(`Switch failed (${err.name}). Previous camera restored.`);
+    } catch (restoreErr) {
       streamRef.current = null;
       setCameraReady(false);
       setError(
-        `Camera switch failed: ${error.message}. ` +
-        `Camera restore failed: ${restoreError.message}.`
+        `Switch failed: ${err.name}. Restore failed: ${restoreErr.name}.`
       );
-      return;
     }
-
-    setError(`Camera switch failed: ${error.message}. Previous camera restored.`);
   }
 };
 
